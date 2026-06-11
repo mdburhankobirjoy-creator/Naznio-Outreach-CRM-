@@ -12,11 +12,11 @@ import { INITIAL_LEADS, NICHES_DATA, WORKFLOW_STEPS, EMAIL_TEMPLATES } from './d
 import JSZip from 'jszip';
 
 // Raw file string imports for clean source ZIP download (bypasses Vite runtime transpilation)
-import packageJsonText from '../package.json?raw';
-import viteConfigText from '../vite.config.ts?raw';
-import tsconfigJsonText from '../tsconfig.json?raw';
-import indexHtmlText from '../index.html?raw';
-import gitignoreText from '../.gitignore?raw';
+import packageJsonText from './package.json?raw';
+import viteConfigText from './vite.config.ts?raw';
+import tsconfigJsonText from './tsconfig.json?raw';
+import indexHtmlText from './index.html?raw';
+import gitignoreText from './.gitignore?raw';
 import mainTsxText from './main.tsx?raw';
 import appTsxText from './App.tsx?raw';
 import dataTsText from './data.ts?raw';
