@@ -10,13 +10,14 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Lead, NicheInfo, StepGuide, User, ActivityLog } from './types';
 import { INITIAL_LEADS, NICHES_DATA, WORKFLOW_STEPS, EMAIL_TEMPLATES } from './data';
 import JSZip from 'jszip';
+import { supabase } from './lib/supabaseClient';
 
 // Raw file string imports for clean source ZIP download (bypasses Vite runtime transpilation)
-import packageJsonText from '../package.json?raw';
-import viteConfigText from '../vite.config.ts?raw';
-import tsconfigJsonText from '../tsconfig.json?raw';
-import indexHtmlText from '../index.html?raw';
-import gitignoreText from '../.gitignore?raw';
+import packageJsonText from './package.json?raw';
+import viteConfigText from './vite.config.ts?raw';
+import tsconfigJsonText from './tsconfig.json?raw';
+import indexHtmlText from './index.html?raw';
+import gitignoreText from './.gitignore?raw';
 import mainTsxText from './main.tsx?raw';
 import appTsxText from './App.tsx?raw';
 import dataTsText from './data.ts?raw';
@@ -32,25 +33,10 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [isZipping, setIsZipping] = useState(false);
 
-  // Multiuser System States - Synchronized with LocalStorage
-  const [users, setUsers] = useState<User[]>(() => {
-    const saved = localStorage.getItem('outreach_users_data');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed && parsed.length > 0) return parsed;
-      } catch (e) {}
-    }
-    const defaultAdmin: User = { 
-      id: 'u-1', 
-      username: 'admin', 
-      password: 'admin123', 
-      role: 'Admin', 
-      createdAt: new Date().toISOString().split('T')[0] 
-    };
-    localStorage.setItem('outreach_users_data', JSON.stringify([defaultAdmin]));
-    return [defaultAdmin];
-  });
+  // Multiuser System States - Synchronized with Supabase (shared cloud database)
+  // currentUser session stays in localStorage (per-device login), everything else is shared.
+  const [users, setUsers] = useState<User[]>([]);
+  const [dataLoaded, setDataLoaded] = useState(false);
 
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
     const saved = localStorage.getItem('outreach_current_user');
@@ -64,16 +50,76 @@ export default function App() {
     return null;
   });
 
-  const [activityLogs, setActivityLogs] = useState<ActivityLog[]>(() => {
-    const saved = localStorage.getItem('outreach_activity_logs');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      } catch (e) {}
-    }
-    return [];
+  const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
+
+  // Convert between DB (snake_case) rows and the app's (camelCase) types
+  const rowToUser = (r: any): User => ({
+    id: r.id, username: r.username, password: r.password, role: r.role, createdAt: r.created_at,
   });
+  const rowToLead = (r: any): Lead => ({
+    id: r.id, businessName: r.business_name, ownerName: r.owner_name, email: r.email, phone: r.phone,
+    website: r.website, niche: r.niche, cityState: r.city_state, source: r.source, status: r.status,
+    lastContacted: r.last_contacted, nextFollowUp: r.next_follow_up, notes: r.notes, createdBy: r.created_by,
+  });
+  const rowToLog = (r: any): ActivityLog => ({
+    id: r.id, username: r.username, businessName: r.business_name, leadId: r.lead_id, type: r.type, timestamp: r.timestamp,
+  });
+
+  // Initial fetch from Supabase + seed defaults if the DB is empty (first-ever run)
+  useEffect(() => {
+    const loadAll = async () => {
+      const [{ data: usersData, error: usersErr }, { data: leadsData, error: leadsErr }, { data: logsData }] = await Promise.all([
+        supabase.from('users').select('*'),
+        supabase.from('leads').select('*'),
+        supabase.from('activity_logs').select('*').order('timestamp', { ascending: false }),
+      ]);
+
+      if (!usersErr && usersData && usersData.length > 0) {
+        setUsers(usersData.map(rowToUser));
+      } else {
+        const defaultAdmin: User = { id: 'u-1', username: 'admin', password: 'admin123', role: 'Admin', createdAt: new Date().toISOString().split('T')[0] };
+        await supabase.from('users').upsert([{ id: defaultAdmin.id, username: defaultAdmin.username, password: defaultAdmin.password, role: defaultAdmin.role, created_at: defaultAdmin.createdAt }]);
+        setUsers([defaultAdmin]);
+      }
+
+      if (!leadsErr && leadsData && leadsData.length > 0) {
+        setLeads(leadsData.map(rowToLead));
+      } else {
+        await supabase.from('leads').upsert(INITIAL_LEADS.map(l => ({
+          id: l.id, business_name: l.businessName, owner_name: l.ownerName, email: l.email, phone: l.phone,
+          website: l.website, niche: l.niche, city_state: l.cityState, source: l.source, status: l.status,
+          last_contacted: l.lastContacted, next_follow_up: l.nextFollowUp, notes: l.notes, created_by: l.createdBy,
+        })));
+        setLeads(INITIAL_LEADS);
+      }
+
+      if (logsData) setActivityLogs(logsData.map(rowToLog));
+
+      setDataLoaded(true);
+    };
+    loadAll();
+  }, []);
+
+  // Realtime sync: instantly reflect changes made by other users in other browsers
+  useEffect(() => {
+    const channel = supabase
+      .channel('crm-shared-data')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'leads' }, async () => {
+        const { data } = await supabase.from('leads').select('*');
+        if (data) setLeads(data.map(rowToLead));
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, async () => {
+        const { data } = await supabase.from('users').select('*');
+        if (data) setUsers(data.map(rowToUser));
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'activity_logs' }, async () => {
+        const { data } = await supabase.from('activity_logs').select('*').order('timestamp', { ascending: false });
+        if (data) setActivityLogs(data.map(rowToLog));
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, []);
 
   // Login Form States
   const [loginUsername, setLoginUsername] = useState('');
@@ -88,33 +134,42 @@ export default function App() {
   // Selected user for stats filter
   const [statsUserFilter, setStatsUserFilter] = useState<string>('All');
 
-  // Leads state initialized from LocalStorage or default sample
-  const [leads, setLeads] = useState<Lead[]>(() => {
-    const saved = localStorage.getItem('outreach_leads_data');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      } catch (e) {}
-    }
-    localStorage.setItem('outreach_leads_data', JSON.stringify(INITIAL_LEADS));
-    return INITIAL_LEADS;
-  });
+  // Leads state: populated from Supabase by the loadAll() effect above
+  const [leads, setLeads] = useState<Lead[]>([]);
 
-  // Helper wrappers with localStorage persistence
+  // Helper wrappers: update local state immediately (optimistic UI) AND
+  // write through to Supabase so every other logged-in user sees it too.
   const saveUsers = (newUsers: User[]) => {
     setUsers(newUsers);
-    localStorage.setItem('outreach_users_data', JSON.stringify(newUsers));
+    supabase.from('users').upsert(newUsers.map(u => ({
+      id: u.id, username: u.username, password: u.password, role: u.role, created_at: u.createdAt,
+    }))).then(({ error }) => { if (error) console.error('saveUsers error:', error); });
+    const currentIds = newUsers.map(u => u.id);
+    if (currentIds.length > 0) {
+      supabase.from('users').delete().not('id', 'in', `(${currentIds.join(',')})`).then(() => {});
+    }
   };
 
   const saveLeads = (newLeads: Lead[]) => {
     setLeads(newLeads);
-    localStorage.setItem('outreach_leads_data', JSON.stringify(newLeads));
+    supabase.from('leads').upsert(newLeads.map(l => ({
+      id: l.id, business_name: l.businessName, owner_name: l.ownerName, email: l.email, phone: l.phone,
+      website: l.website, niche: l.niche, city_state: l.cityState, source: l.source, status: l.status,
+      last_contacted: l.lastContacted, next_follow_up: l.nextFollowUp, notes: l.notes, created_by: l.createdBy,
+    }))).then(({ error }) => { if (error) console.error('saveLeads error:', error); });
+    const currentIds = newLeads.map(l => l.id);
+    if (currentIds.length > 0) {
+      supabase.from('leads').delete().not('id', 'in', `(${currentIds.join(',')})`).then(() => {});
+    } else {
+      supabase.from('leads').delete().neq('id', '__none__').then(() => {});
+    }
   };
 
   const saveActivityLogs = (newLogs: ActivityLog[]) => {
     setActivityLogs(newLogs);
-    localStorage.setItem('outreach_activity_logs', JSON.stringify(newLogs));
+    supabase.from('activity_logs').upsert(newLogs.map(l => ({
+      id: l.id, username: l.username, business_name: l.businessName, lead_id: l.leadId, type: l.type, timestamp: l.timestamp,
+    }))).then(({ error }) => { if (error) console.error('saveActivityLogs error:', error); });
   };
 
   // Track finished guide steps (using checklist state in localStorage)
@@ -141,10 +196,6 @@ export default function App() {
   // Notification Toast state
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
 
-  // Gemini key state loaded from localStorage
-  const [apiKeyInput, setApiKeyInput] = useState<string>(() => {
-    return localStorage.getItem('outreach_gemini_api_key') || '';
-  });
   
   // Refined Email Subject and Body States
   const [customAiRefinedSubject, setCustomAiRefinedSubject] = useState<string>('');
@@ -196,11 +247,6 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('outreach_your_name', customYourName);
   }, [customYourName]);
-
-  // Persist Gemini API configuration selection
-  useEffect(() => {
-    localStorage.setItem('outreach_gemini_api_key', apiKeyInput);
-  }, [apiKeyInput]);
 
   useEffect(() => {
     localStorage.setItem('outreach_global_instructions', aiGlobalInstructions);
@@ -678,7 +724,7 @@ Strategy Consultant, Naznio Strategy Lab`;
 
   const { subject: compiledSubject, body: compiledBody } = getCompiledEmail();
 
-  // Robustly extract subject & body from Gemini JSON / Markdown response
+  // Robustly extract subject & body from Claude JSON / Markdown response
   const extractSubjectAndBody = (text: string) => {
     let subject = "";
     let body = "";
@@ -720,26 +766,13 @@ Strategy Consultant, Naznio Strategy Lab`;
     return { subject, body };
   };
 
-  // Call the Gemini API to customize the email based on user feedback and instructions
+  // Call the Claude AI agent (via secure Supabase Edge Function) to customize the email based on user feedback and instructions
   const handleGenerateWithAi = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!aiFeedbackInput.trim() && !aiGlobalInstructions.trim()) return;
 
-    // Use user-provided API key from settings input, or default to env variable if present
-    const activeKey = apiKeyInput.trim() || (import.meta.env ? (import.meta.env.VITE_GEMINI_API_KEY || '') : '');
-    
-    if (!activeKey) {
-      triggerToast(
-        lang === 'en' 
-          ? '🔑 Please set your Gemini API Key in the "Advanced AI Control" section below!' 
-          : '🔑 অনুগ্রহ করে নিচের "অ্যাডভান্সড এআই সেটিংস" ফিল্ডে জেমিনি এপিআই কি দিন!', 
-        'error'
-      );
-      return;
-    }
-
     setAiIsGenerating(true);
-    triggerToast(lang === 'en' ? 'Consulting Gemini AI companion...' : 'জেমিনি এআই সহযোগীর সাথে যোগাযোগ করা হচ্ছে...', 'info');
+    triggerToast(lang === 'en' ? 'Consulting Claude AI agent...' : 'ক্লদ এআই এজেন্টের সাথে যোগাযোগ করা হচ্ছে...', 'info');
 
     // Get current compiled template text as context (before AI override is applied)
     const originalSubject = activeSelectedLead ? (
@@ -810,29 +843,20 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
 `;
 
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.1-flash:generateContent?key=${activeKey}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: instructionsText }]
-            }
-          ]
-        })
+      // Calls our Supabase Edge Function, which securely calls Claude server-side.
+      // The Anthropic API key never touches the browser (see supabase/functions/ai-email-agent).
+      const { data: resData, error } = await supabase.functions.invoke('ai-email-agent', {
+        body: { prompt: instructionsText },
       });
 
-      if (!response.ok) {
-        throw new Error(`API returned HTTP status ${response.status}`);
+      if (error) {
+        throw new Error(error.message || 'Edge function error');
       }
 
-      const resData = await response.json();
-      const textOutput = resData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      
+      const textOutput = resData?.text || '';
+
       if (!textOutput) {
-        throw new Error('Empty response received from Gemini API');
+        throw new Error('Empty response received from Claude');
       }
 
       const { subject: aiSubject, body: aiBody } = extractSubjectAndBody(textOutput);
@@ -844,8 +868,8 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
       
       triggerToast(
         lang === 'en' 
-          ? 'Email customized successfully by Gemini!' 
-          : 'জেমিনি এআই সফলভাবে ইমেইলটি কাস্টমাইজ করেছে!', 
+          ? 'Email customized successfully by Claude!' 
+          : 'ক্লদ এআই সফলভাবে ইমেইলটি কাস্টমাইজ করেছে!', 
         'success'
       );
       setAiFeedbackInput(''); // Clear the chat input on success
@@ -853,8 +877,8 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
       console.error(err);
       triggerToast(
         lang === 'en' 
-          ? `Gemini Error: ${err.message || 'Please verify your API key.'}` 
-          : `এআই সংযোগ ত্রুটি: ${err.message || 'অনুগ্রহ করে সঠিক এপিআই কি সেট করুন।'}`, 
+          ? `Claude Error: ${err.message || 'Please try again.'}` 
+          : `এআই সংযোগ ত্রুটি: ${err.message || 'আবার চেষ্টা করুন।'}`, 
         'error'
       );
     } finally {
@@ -1727,13 +1751,13 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
                         )}
                       </div>
 
-                      {/* GEMINI AI COPILOT EXPERT WRITER */}
+                      {/* CLAUDE AI AGENT — writes/refines the email, key lives server-side only */}
                       <div className="mt-2 pt-3 border-t border-slate-150 flex flex-col gap-2.5" id="ai-feedback-companion-container">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-1.5 text-slate-800">
                             <Sparkles className="w-3.5 h-3.5 text-indigo-600 animate-pulse animate-ease-in-out" />
                             <span className="text-xs font-bold font-sans">
-                              {lang === 'en' ? 'Gemini AI Copywriter' : 'জেমিনি এআই কপিরাইটার'}
+                              {lang === 'en' ? 'Claude AI Agent' : 'ক্লদ এআই এজেন্ট'}
                             </span>
                           </div>
                           
@@ -1753,7 +1777,7 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
                             </div>
                           ) : (
                             <span className="text-[10px] text-slate-400 font-mono">
-                              {lang === 'en' ? 'v2.1 Flash Model' : 'Flash ২.১ মডেল'}
+                              {lang === 'en' ? 'Claude Sonnet' : 'ক্লদ সনেট'}
                             </span>
                           )}
                         </div>
@@ -1765,8 +1789,8 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
                               value={aiFeedbackInput}
                               onChange={(e) => setAiFeedbackInput(e.target.value)}
                               placeholder={lang === 'en' 
-                                ? "Ask Gemini: 'translate to Bengali', 'make it shorter', 'always suggest a free audit'..." 
-                                : "জেমিনি-কে বলুন: 'মেইলটি বাংলায় অনুবাদ করো', 'টোন পরিবর্তন করো', 'আরো সংক্ষিপ্ত ও আকর্ষণীয় করো'"
+                                ? "Ask Claude: 'translate to Bengali', 'make it shorter', 'always suggest a free audit'..." 
+                                : "ক্লদ-কে বলুন: 'মেইলটি বাংলায় অনুবাদ করো', 'টোন পরিবর্তন করো', 'আরো সংক্ষিপ্ত ও আকর্ষণীয় করো'"
                               }
                               rows={2}
                               className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2 text-xs text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-sans resize-none"
@@ -1825,37 +1849,16 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
                             exit={{ opacity: 0, height: 0 }}
                             className="bg-indigo-50/50 rounded-lg p-2.5 border border-indigo-100 flex flex-col gap-2 text-xs"
                           >
-                            {/* API Key prompt */}
+                            {/* API key note — Claude's key lives server-side in the Supabase Edge Function, never in the browser */}
                             <div>
                               <div className="flex items-center gap-1.5 text-indigo-900 font-bold text-[10px] uppercase mb-1">
                                 <Key className="w-3.5 h-3.5 text-indigo-600" />
-                                <span>{lang === 'en' ? 'Gemini API Key (Local Auto-Save):' : 'জেমিনি এপিআই কি (ব্রাউজারে সংরক্ষিত):'}</span>
+                                <span>{lang === 'en' ? 'Claude AI Agent' : 'ক্লদ এআই এজেন্ট'}</span>
                               </div>
-                              <div className="flex gap-1.5">
-                                <input
-                                  type="password"
-                                  value={apiKeyInput}
-                                  onChange={(e) => setApiKeyInput(e.target.value)}
-                                  placeholder={lang === 'en' ? "AIzaSy..." : "এপিআই কি পেস্ট করুন..."}
-                                  className="bg-white border border-indigo-200 rounded p-1 text-xs text-slate-700 flex-1 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                                />
-                                {apiKeyInput && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setApiKeyInput('');
-                                      triggerToast(lang === 'en' ? 'API Key cleared' : 'এপিআই কি মুছে ফেলা হয়েছে', 'info');
-                                    }}
-                                    className="px-2 py-0.5 bg-rose-50 text-rose-600 rounded border border-rose-200 hover:bg-rose-100 text-[10px] cursor-pointer"
-                                  >
-                                    {lang === 'en' ? 'Clear' : 'মুছুন'}
-                                  </button>
-                                )}
-                              </div>
-                              <p className="text-[9px] text-indigo-700/80 mt-1 leading-snug">
+                              <p className="text-[9px] text-indigo-700/80 leading-snug">
                                 {lang === 'en'
-                                  ? 'Need a key? Create a free, safe API key in Google AI Studio. Leave empty if a backend env secret is set.'
-                                  : 'একটি কি প্রয়োজন? গুগল এআই স্টুডিও থেকে ফ্রি সেফ কি তৈরি করে নিন। এনভায়রনমেন্ট ভ্যারিয়েবল সেট করা থাকলে এটি ফাঁকা রাখুন।'}
+                                  ? 'Powered by a secure server-side agent — no API key needed here. Ask it anything in the box above and it will draft or refine the email.'
+                                  : 'সার্ভার-সাইড সিকিউর এজেন্ট দিয়ে চলছে — এখানে কোনো এপিআই কি লাগবে না। ওপরের বক্সে যা চান লিখুন, এআই মেইল লিখে বা পরিবর্তন করে দেবে।'}
                               </p>
                             </div>
 
