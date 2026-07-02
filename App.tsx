@@ -1,15 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Plus, Edit2, Trash2, Search, Mail, Copy, ExternalLink, 
   CheckCircle2, Layers, Globe, Phone, MapPin, Sparkles, 
   Languages, BookOpen, TrendingUp, Check, X, Download, 
   PlusCircle, AlertCircle, FileText, ChevronRight, HelpCircle,
-  Undo2, RefreshCw, Calendar, Send, Users, Lock, LogOut, Key, Shield, UserPlus, Settings
+  Undo2, RefreshCw, Calendar, Send, Users, Lock, LogOut, Key, Shield, UserPlus, Settings,
+  Upload, Loader2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Lead, NicheInfo, StepGuide, User, ActivityLog } from './types';
 import { INITIAL_LEADS, NICHES_DATA, WORKFLOW_STEPS, EMAIL_TEMPLATES } from './data';
 import JSZip from 'jszip';
+import * as XLSX from 'xlsx';
 import { supabase } from './lib/supabaseClient';
 
 // Raw file string imports for clean source ZIP download (bypasses Vite runtime transpilation)
@@ -170,6 +172,107 @@ export default function App() {
     supabase.from('activity_logs').upsert(newLogs.map(l => ({
       id: l.id, username: l.username, business_name: l.businessName, lead_id: l.leadId, type: l.type, timestamp: l.timestamp,
     }))).then(({ error }) => { if (error) console.error('saveActivityLogs error:', error); });
+  };
+
+  // ── Bulk Lead Import from CSV / Excel file ──
+  const fileImportInputRef = useRef<HTMLInputElement>(null);
+  const [isImportingLeads, setIsImportingLeads] = useState(false);
+
+  // Matches a spreadsheet column header (however it's worded) to one of our Lead fields
+  const matchLeadColumn = (header: string): keyof Lead | null => {
+    const h = header.toLowerCase().trim().replace(/[\s_-]+/g, ' ');
+    if (/business|company|brand|organi[sz]ation/.test(h)) return 'businessName';
+    if (/owner|contact person|contact name|full name|^name$/.test(h)) return 'ownerName';
+    if (/e[\s-]?mail/.test(h)) return 'email';
+    if (/phone|mobile|contact number|whatsapp/.test(h)) return 'phone';
+    if (/website|url|domain|site/.test(h)) return 'website';
+    if (/niche|industry|category|vertical/.test(h)) return 'niche';
+    if (/city|state|location|address|area/.test(h)) return 'cityState';
+    if (/source/.test(h)) return 'source';
+    if (/note|comment|remark/.test(h)) return 'notes';
+    return null;
+  };
+
+  const handleImportLeadsFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsImportingLeads(true);
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows: Record<string, any>[] = XLSX.utils.sheet_to_json(firstSheet, { defval: '' });
+
+      if (!rows.length) {
+        triggerToast(lang === 'en' ? 'The file appears to be empty.' : 'ফাইলটি খালি মনে হচ্ছে।', 'error');
+        setIsImportingLeads(false);
+        return;
+      }
+
+      // Map each spreadsheet header to a Lead field, once, using the first row's keys
+      const headerMap: Record<string, keyof Lead | null> = {};
+      Object.keys(rows[0]).forEach(h => { headerMap[h] = matchLeadColumn(h); });
+
+      const importedLeads: Lead[] = rows
+        .map((row, idx) => {
+          const lead: Partial<Lead> = {};
+          Object.entries(row).forEach(([header, value]) => {
+            const field = headerMap[header];
+            if (field && value !== undefined && value !== null) {
+              (lead as any)[field] = String(value).trim();
+            }
+          });
+          if (!lead.businessName) return null; // skip rows with no business name — can't work with those
+          return {
+            id: `lead-import-${Date.now()}-${idx}`,
+            businessName: lead.businessName,
+            ownerName: lead.ownerName || '',
+            email: lead.email || '',
+            phone: lead.phone || '',
+            website: lead.website || '',
+            niche: lead.niche || 'High-Ticket Services',
+            cityState: lead.cityState || '',
+            source: lead.source || `Bulk Import (${file.name})`,
+            status: 'Not Sent',
+            lastContacted: '',
+            nextFollowUp: '',
+            notes: lead.notes || '',
+            createdBy: currentUser?.username,
+          } as Lead;
+        })
+        .filter((l): l is Lead => l !== null);
+
+      if (!importedLeads.length) {
+        triggerToast(
+          lang === 'en'
+            ? "Couldn't find a 'Business Name' column — please check your file's headers."
+            : "'Business Name' কলাম খুঁজে পাওয়া যায়নি — ফাইলের হেডার চেক করুন।",
+          'error'
+        );
+        setIsImportingLeads(false);
+        return;
+      }
+
+      saveLeads([...importedLeads, ...leads]);
+      triggerToast(
+        lang === 'en'
+          ? `Imported ${importedLeads.length} lead(s) successfully! Select any lead to have Claude write a personalized cold email.`
+          : `${importedLeads.length}টি লিড সফলভাবে ইম্পোর্ট হয়েছে! এখন যেকোনো লিড সিলেক্ট করে ক্লদ দিয়ে personalized ইমেইল লিখিয়ে নিন।`,
+        'success'
+      );
+    } catch (err: any) {
+      console.error(err);
+      triggerToast(
+        lang === 'en'
+          ? `Import failed: ${err.message || 'Please check the file format (.csv, .xlsx, .xls).'}`
+          : `ইম্পোর্ট ব্যর্থ হয়েছে: ${err.message || 'ফাইল ফরম্যাট (.csv, .xlsx, .xls) চেক করুন।'}`,
+        'error'
+      );
+    } finally {
+      setIsImportingLeads(false);
+      if (fileImportInputRef.current) fileImportInputRef.current.value = '';
+    }
   };
 
   // Track finished guide steps (using checklist state in localStorage)
@@ -808,7 +911,9 @@ Strategy Consultant, Naznio Strategy Lab`;
 - Prospective Client Business Name: ${activeSelectedLead.businessName}
 - Contact Person / Owner Name: ${activeSelectedLead.ownerName || 'Unknown'}
 - Client Niche: ${activeSelectedLead.niche}
+- Website: ${activeSelectedLead.website || 'N/A'}
 - City & State: ${activeSelectedLead.cityState || 'N/A'}
+- Lead Source: ${activeSelectedLead.source || 'N/A'}
 - Custom Notes: ${activeSelectedLead.notes || 'None'}
 - Custom Case Study context: ${getNicheCaseStudy(activeSelectedLead.niche || 'Local Business')}
 ` : '';
@@ -1503,6 +1608,44 @@ ${aiGlobalInstructions ? `The user also has these chronic style rules / global g
                         </table>
                       )}
                     </div>
+                  </div>
+
+                  {/* BULK IMPORT LEADS FROM CSV/EXCEL FILE */}
+                  <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3">
+                    <h3 className="text-xs font-semibold uppercase text-indigo-700 mb-2 flex items-center gap-1">
+                      <Upload className="w-4 h-4 text-indigo-600" />
+                      {lang === 'en' ? 'Import Leads from File' : 'ফাইল থেকে লিড ইম্পোর্ট করুন'}
+                    </h3>
+                    <p className="text-[10px] text-indigo-700/80 mb-2 leading-snug">
+                      {lang === 'en'
+                        ? 'Upload a .csv or .xlsx file with your lead list (columns like Business Name, Website, Niche, Email, Phone work automatically). Then select any imported lead and ask Claude to write a personalized cold email using those details.'
+                        : '.csv অথবা .xlsx ফাইল আপলোড করুন (Business Name, Website, Niche, Email, Phone — এই ধরনের কলাম থাকলে অটোমেটিক চিনে নেবে)। এরপর যেকোনো ইম্পোর্ট করা লিড সিলেক্ট করে ক্লদ-কে বলুন সেই তথ্য দিয়ে personalized cold email লিখতে।'}
+                    </p>
+                    <input
+                      ref={fileImportInputRef}
+                      type="file"
+                      accept=".csv,.xlsx,.xls"
+                      onChange={handleImportLeadsFile}
+                      className="hidden"
+                      id="lead-file-import-input"
+                    />
+                    <button
+                      onClick={() => fileImportInputRef.current?.click()}
+                      disabled={isImportingLeads}
+                      className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-semibold py-2 px-3 rounded flex justify-center items-center gap-1.5 cursor-pointer"
+                    >
+                      {isImportingLeads ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          {lang === 'en' ? 'Importing...' : 'ইম্পোর্ট হচ্ছে...'}
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="w-3.5 h-3.5" />
+                          {lang === 'en' ? 'Choose File (.csv / .xlsx)' : 'ফাইল বেছে নিন (.csv / .xlsx)'}
+                        </>
+                      )}
+                    </button>
                   </div>
 
                   {/* MINI FORM TO SPEED DIAL A LEAD DIRECTLY */}
